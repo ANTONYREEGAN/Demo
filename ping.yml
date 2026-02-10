@@ -1,0 +1,6 @@
+- name: Ping EC2 from AWX
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Ping test
+      ansible.builtin.ping:
