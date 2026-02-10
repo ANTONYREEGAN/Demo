@@ -1,0 +1,23 @@
+---
+- name: CPU and Memory health check
+  hosts: all
+  gather_facts: yes
+  become: yes
+ 
+  tasks:
+    - name: Show CPU cores
+      ansible.builtin.debug:
+        msg: "CPU cores: {{ ansible_facts.processor_vcpus }}"
+ 
+    - name: Show total memory
+      ansible.builtin.debug:
+        msg: "Total Memory: {{ (ansible_facts.memtotal_mb / 1024) | round(2) }} GB"
+ 
+    - name: Show free memory
+      ansible.builtin.debug:
+        msg: "Free Memory: {{ (ansible_facts.memfree_mb / 1024) | round(2) }} GB"
+ 
+    - name: Show CPU architecture
+      ansible.builtin.debug:
+        msg: "CPU Architecture: {{ ansible_facts.architecture }}"
+ 
