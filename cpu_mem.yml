@@ -2,7 +2,7 @@
 - name: CPU and Memory health check
   hosts: all
   gather_facts: yes
-  become: yes
+  become: no
  
   tasks:
     - name: Show CPU cores
