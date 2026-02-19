@@ -1,0 +1,273 @@
+---
+- name: Ubuntu Health Check
+  hosts: testserver
+  gather_facts: true
+  become: true
+
+  vars:
+    hc_min_free_root_gb: 2              # fail if / free space < this
+    hc_max_load_avg_1m: 4               # fail if 1m load > this
+    hc_max_cpu_iowait_pct: 20           # fail if iowait > this
+    hc_min_mem_available_mb: 512        # fail if MemAvailable < this
+    hc_max_disk_inode_used_pct: 85      # fail if inode usage % > this
+    hc_critical_services:               # set what must be running/enabled
+      - systemd-timesyncd
+      - cron
+      - ssh
+    hc_check_updates: true              # advisory only (won't fail job)
+    hc_check_ufw: true                  # advisory only
+    hc_check_time_sync: true            # assert if clock is skewed > 5 mins
+    hc_time_skew_max_seconds: 300
+    hc_report_dir: "/var/tmp"
+    hc_report_name: "healthcheck_{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic }}.json"
+
+  tasks:
+
+    - name: Ensure jq is present for local JSON validation (advisory)
+      package:
+        name: jq
+        state: present
+      ignore_errors: true
+
+    - name: Collect disk filesystem facts
+      ansible.builtin.command: df -PT
+      register: df_pt
+      changed: false
+
+    - name: Collect inode usage facts
+      ansible.builtin.command: df -Pi
+      register: df_pi
+      changed: false
+
+    - name: Collect load averages
+      ansible.builtin.command: cat /proc/loadavg
+      register: loadavg
+      changed: false
+
+    - name: Collect CPU iowait (avg of last sample via mpstat)
+      ansible.builtin.package:
+        name: sysstat
+        state: present
+    - name: Get mpstat 1 second sample
+      ansible.builtin.command: mpstat 1 1
+      register: mpstat_out
+      changed: false
+
+    - name: Collect memory info
+      ansible.builtin.command: cat /proc/meminfo
+      register: meminfo
+      changed: false
+
+    - name: Collect zombie process count
+      ansible.builtin.shell: "ps -eo stat= | grep -c 'Z' || true"
+      register: zombie_count
+      changed: false
+
+    - name: Collect top CPU consumers (top 5)
+      ansible.builtin.shell: "ps -eo pid,comm,%cpu --sort=-%cpu | head -n 6"
+      register: top_cpu
+      changed: false
+
+    - name: Collect top memory consumers (top 5)
+      ansible.builtin.shell: "ps -eo pid,comm,%mem --sort=-%mem | head -n 6"
+      register: top_mem
+      changed: false
+
+    - name: Check systemd service states (running/enabled)
+      ansible.builtin.service_facts:
+
+    - name: Check package updates (Ubuntu/Debian)
+      when: hc_check_updates
+      block:
+        - ansible.builtin.command: apt-get -s upgrade
+          register: apt_sim
+          changed: false
+          failed_when: false
+
+    - name: Check UFW status
+      when: hc_check_ufw
+      block:
+        - ansible.builtin.command: ufw status
+          register: ufw_status
+          changed: false
+          failed_when: false
+
+    - name: Check NTP time sync
+      when: hc_check_time_sync
+      block:
+        - name: Ensure systemd-timesyncd or chrony exists (advisory)
+          ansible.builtin.shell: |
+            (systemctl is-active --quiet systemd-timesyncd && echo "systemd-timesyncd active") || \
+            (systemctl is-active --quiet chrony && echo "chrony active") || \
+            echo "no ntp service"
+          register: ntp_service
+          changed: false
+          failed_when: false
+
+        - name: Get clock offset (chronyc first, then timedatectl)
+          ansible.builtin.shell: |
+            if command -v chronyc >/dev/null 2>&1; then
+              chronyc tracking | awk -F': ' '/Last offset/ {gsub(/s/,"",$2); print $2}'
+            else
+              timedatectl show-timesync --property=ServerAddress,PollIntervalUSec,FrequencyUSec || true
+              # Fallback: 0 offset if not available
+              echo 0
+            fi
+          register: clock_offset_raw
+          changed: false
+          failed_when: false
+
+    - name: Parse facts and build structured result
+      vars:
+        root_line: "{{ df_pt.stdout_lines | select('match','^/.*\\s+/\\s') | list | first | default('') }}"
+        root_free_gb: >-
+          {{
+            (root_line.split()|length>3)
+            | ternary( ( (root_line.split()[3]|int) / 1024 / 1024 ), 0 )
+          }}
+        inode_warn: >-
+          {{
+            (df_pi.stdout_lines | select('match','^/.*') | map('split') |
+             map('last') | map('int') | list | max(default=0)) > hc_max_disk_inode_used_pct
+          }}
+        load_1m: "{{ (loadavg.stdout.split()[0] | float) if loadavg.stdout is defined and loadavg.stdout|length>0 else 0 }}"
+        iowait_pct: >-
+          {{
+            (mpstat_out.stdout_lines | select('search','^\\s*Average') | list | last | default('') )
+             | regex_search(' (\\d+\\.\\d+|\\d+)\\s*$', '\\1') | default('0') | float
+          }}
+        mem_available_mb: >-
+          {{
+            (meminfo.stdout_lines | select('search','^MemAvailable:') | list | first | default('MemAvailable: 0 kB') )
+              .split()[1] | int // 1024
+          }}
+        zombies: "{{ (zombie_count.stdout | default('0')) | int }}"
+        critical_not_running: >-
+          {{
+            hc_critical_services | select('match','.*') | select('reject',
+              'in',
+              (services | dict2items | selectattr('value.state','equalto','running') | map(attribute='key') | list)
+            ) | list
+          }}
+        critical_not_enabled: >-
+          {{
+            hc_critical_services | select('match','.*') | select('reject',
+              'in',
+              (services | dict2items | selectattr('value.status','defined') | selectattr('value.status','equalto','enabled') | map(attribute='key') | list)
+            ) | list
+          }}
+        apt_updates_summary: >-
+          {{
+            (hc_check_updates and apt_sim.stdout is defined)
+            | ternary( (apt_sim.stdout | regex_search('^(\\d+) upgraded, (\\d+) newly installed, (\\d+) to remove, (\\d+) not upgraded\\.', multiline=True)), [] )
+          }}
+        ufw_enabled: >-
+          {{
+            (hc_check_ufw and ufw_status.stdout is defined and 'Status: active' in ufw_status.stdout)
+          }}
+        clock_offset_sec: >-
+          {{
+            (clock_offset_raw.stdout | default('0')) | float
+          }}
+      set_fact:
+        hc_result:
+          host: "{{ inventory_hostname }}"
+          datetime: "{{ ansible_date_time.iso8601 }}"
+          os:
+            distro: "{{ ansible_distribution }}"
+            version: "{{ ansible_distribution_version }}"
+            kernel: "{{ ansible_kernel }}"
+          cpu:
+            cores: "{{ ansible_processor_vcpus | default(ansible_processor_count) }}"
+            load_1m: "{{ load_1m }}"
+            iowait_pct: "{{ iowait_pct }}"
+          memory:
+            mem_total_mb: "{{ ansible_memtotal_mb }}"
+            mem_available_mb: "{{ mem_available_mb }}"
+          disk:
+            root_free_gb: "{{ root_free_gb | round(2) }}"
+            inode_any_fs_over_pct: "{{ inode_warn }}"
+          processes:
+            zombies: "{{ zombies }}"
+            top_cpu: "{{ top_cpu.stdout_lines | default([]) }}"
+            top_mem: "{{ top_mem.stdout_lines | default([]) }}"
+          services:
+            critical_expected: "{{ hc_critical_services }}"
+            not_running: "{{ critical_not_running }}"
+            not_enabled: "{{ critical_not_enabled }}"
+          security:
+            ufw_enabled: "{{ ufw_enabled | default(false) }}"
+          updates:
+            summary_line: "{{ apt_sim.stdout | regex_search('^\\d+ upgraded.*$', multiline=True) if hc_check_updates and apt_sim.stdout is defined else '' }}"
+          time:
+            ntp_service: "{{ ntp_service.stdout | default('unknown') }}"
+            clock_offset_sec: "{{ clock_offset_sec }}"
+          thresholds:
+            min_free_root_gb: "{{ hc_min_free_root_gb }}"
+            max_load_avg_1m: "{{ hc_max_load_avg_1m }}"
+            max_cpu_iowait_pct: "{{ hc_max_cpu_iowait_pct }}"
+            min_mem_available_mb: "{{ hc_min_mem_available_mb }}"
+            max_inode_used_pct: "{{ hc_max_disk_inode_used_pct }}"
+            max_clock_skew_sec: "{{ hc_time_skew_max_seconds }}"
+
+    - name: Save JSON report
+      copy:
+        dest: "{{ hc_report_dir }}/{{ hc_report_name }}"
+        content: "{{ hc_result | to_nice_json }}"
+        mode: '0644'
+
+    # ---- Assertions that FAIL the job if unhealthy ----
+    - name: Assert root free space
+      ansible.builtin.assert:
+        that:
+          - (hc_result.disk.root_free_gb | float) >= (hc_min_free_root_gb | float)
+        fail_msg: "Root filesystem free space {{ hc_result.disk.root_free_gb }} GB < {{ hc_min_free_root_gb }} GB"
+
+    - name: Assert 1m load average
+      ansible.builtin.assert:
+        that:
+          - (hc_result.cpu.load_1m | float) <= (hc_max_load_avg_1m | float)
+        fail_msg: "Load average 1m {{ hc_result.cpu.load_1m }} > {{ hc_max_load_avg_1m }}"
+
+    - name: Assert CPU iowait
+      ansible.builtin.assert:
+        that:
+          - (hc_result.cpu.iowait_pct | float) <= (hc_max_cpu_iowait_pct | float)
+        fail_msg: "CPU iowait {{ hc_result.cpu.iowait_pct }}% > {{ hc_max_cpu_iowait_pct }}%"
+
+    - name: Assert memory available
+      ansible.builtin.assert:
+        that:
+          - (hc_result.memory.mem_available_mb | int) >= (hc_min_mem_available_mb | int)
+        fail_msg: "MemAvailable {{ hc_result.memory.mem_available_mb }} MB < {{ hc_min_mem_available_mb }} MB"
+
+    - name: Assert inode usage across filesystems
+      ansible.builtin.assert:
+        that:
+          - not hc_result.disk.inode_any_fs_over_pct
+        fail_msg: "One or more filesystems exceed inode usage threshold {{ hc_max_disk_inode_used_pct }}%"
+
+    - name: Assert critical services running and enabled
+      ansible.builtin.assert:
+        that:
+          - hc_result.services.not_running | length == 0
+          - hc_result.services.not_enabled | length == 0
+        fail_msg: >-
+          Critical service issues.
+          Not running: {{ hc_result.services.not_running | join(', ') }} ;
+          Not enabled: {{ hc_result.services.not_enabled | join(', ') }}
+
+    - name: Assert time sync skew (if check enabled)
+      when: hc_check_time_sync
+      ansible.builtin.assert:
+        that:
+          - (hc_result.time.clock_offset_sec | float) | abs <= (hc_time_skew_max_seconds | float)
+        fail_msg: "Clock skew {{ hc_result.time.clock_offset_sec }}s > {{ hc_time_skew_max_seconds }}s"
+
+    - name: Print final summary
+      ansible.builtin.debug:
+        msg:
+          - "Healthcheck completed for {{ inventory_hostname }}"
+          - "Report: {{ hc_report_dir }}/{{ hc_report_name }}"
+          - "UFW: {{ 'enabled' if hc_result.security.ufw_enabled else 'disabled' }}"
+          - "Updates: {{ hc_result.updates.summary_line | default('N/A') }}"
