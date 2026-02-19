@@ -1,6 +1,6 @@
 ---
 - name: Ubuntu Health Check
-  hosts: ubuntu_servers
+  hosts: testserver
   become: yes
   gather_facts: yes
  
