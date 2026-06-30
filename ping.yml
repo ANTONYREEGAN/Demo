@@ -1,5 +1,5 @@
 - name: Ping EC2 from AWX
-  hosts: all
+  hosts: ubuntu
   gather_facts: no
   tasks:
     - name: Ping test
